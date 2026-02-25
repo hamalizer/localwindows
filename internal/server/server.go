@@ -17,6 +17,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -43,6 +44,7 @@ type Config struct {
 	ServerName string
 	Quality    int
 	MaxFPS     int
+	ReceiveDir string // directory for received files; defaults to user home
 }
 
 // DefaultConfig returns sensible defaults.
@@ -51,11 +53,16 @@ func DefaultConfig() Config {
 	if hostname == "" {
 		hostname = "LocalWindows Host"
 	}
+	homeDir, _ := os.UserHomeDir()
+	if homeDir == "" {
+		homeDir = "."
+	}
 	return Config{
 		Port:       DefaultPort,
 		ServerName: hostname,
 		Quality:    defaultQuality,
 		MaxFPS:     defaultFPS,
+		ReceiveDir: homeDir,
 	}
 }
 
@@ -79,6 +86,7 @@ type Server struct {
 	OnClientDisconnect func(addr string)
 	OnError            func(err error)
 	OnFileReceived     func(name string, size int64)
+	OnClipboardReceived func(text string)
 }
 
 type clientConn struct {
@@ -416,7 +424,10 @@ func (s *Server) handleInputEvents(ctx context.Context, conn *protocol.Conn) {
 			s.handleFileDone(payload)
 
 		case protocol.MsgClipboard:
-			// Future: sync clipboard
+			var clip protocol.ClipboardMsg
+			if err := protocol.DecodeJSON(payload, &clip); err == nil && s.OnClipboardReceived != nil {
+				s.OnClipboardReceived(clip.Text)
+			}
 
 		case protocol.MsgPing:
 			conn.WriteMessage(protocol.MsgPong, nil)
@@ -446,8 +457,9 @@ func (s *Server) handleFileOffer(conn *protocol.Conn, payload []byte) {
 		return
 	}
 
-	// Auto-accept and save to current directory.
-	savePath := offer.FileName
+	// Save to receive directory with dedup.
+	savePath := filepath.Join(s.config.ReceiveDir, filepath.Base(offer.FileName))
+	savePath = uniqueFilePath(savePath)
 	f, err := os.Create(savePath)
 	if err != nil {
 		conn.WriteJSONMessage(protocol.MsgFileReject, protocol.FileRejectMsg{
@@ -609,6 +621,20 @@ func encodeJPEG(img image.Image, quality int) []byte {
 	var buf bytes.Buffer
 	jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality})
 	return buf.Bytes()
+}
+
+func uniqueFilePath(path string) string {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return path
+	}
+	ext := filepath.Ext(path)
+	base := path[:len(path)-len(ext)]
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s_%d%s", base, i, ext)
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
 }
 
 func generateTLSConfig() (*tls.Config, error) {

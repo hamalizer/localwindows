@@ -1,21 +1,26 @@
 package gui
 
 import (
+	"sync"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 
 	"localwindows/internal/client"
+	"localwindows/internal/input"
 )
 
-// interactiveScreen wraps a screen image with mouse event handling.
+// interactiveScreen wraps a screen image with full mouse and keyboard handling.
 type interactiveScreen struct {
 	widget.BaseWidget
-	img      *canvas.Image
-	client   *client.Client
-	remoteW  int
-	remoteH  int
+	img     *canvas.Image
+	client  *client.Client
+	remoteW int
+	remoteH int
+	focused bool
+	mu      sync.Mutex
 }
 
 func newInteractiveScreen(img *canvas.Image, cl *client.Client, rw, rh int) *interactiveScreen {
@@ -33,15 +38,13 @@ func (s *interactiveScreen) CreateRenderer() fyne.WidgetRenderer {
 	return &interactiveScreenRenderer{screen: s}
 }
 
-// Normalize a position within this widget to 0.0-1.0 coordinates relative to
-// the remote screen, accounting for the aspect-ratio fit.
+// normalize converts a widget-local position to 0.0–1.0 normalized coordinates,
+// accounting for aspect-ratio fitting.
 func (s *interactiveScreen) normalize(pos fyne.Position) (float64, float64) {
 	size := s.Size()
 	if size.Width <= 0 || size.Height <= 0 {
 		return 0, 0
 	}
-
-	// Compute the actual drawn area (aspect-ratio fitted).
 	aspect := float32(s.remoteW) / float32(s.remoteH)
 	var drawW, drawH float32
 	if size.Width/size.Height > aspect {
@@ -56,31 +59,82 @@ func (s *interactiveScreen) normalize(pos fyne.Position) (float64, float64) {
 
 	nx := float64((pos.X - offX) / drawW)
 	ny := float64((pos.Y - offY) / drawH)
-
-	// Clamp.
-	if nx < 0 {
-		nx = 0
-	}
-	if nx > 1 {
-		nx = 1
-	}
-	if ny < 0 {
-		ny = 0
-	}
-	if ny > 1 {
-		ny = 1
-	}
-	return nx, ny
+	return clamp01(nx), clamp01(ny)
 }
 
-// --- Mouse events via desktop interfaces ---
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
 
-var _ fyne.Tappable = (*interactiveScreen)(nil)
-var _ fyne.SecondaryTappable = (*interactiveScreen)(nil)
-var _ desktop.Hoverable = (*interactiveScreen)(nil)
-var _ fyne.Draggable = (*interactiveScreen)(nil)
+// --- Interface compliance ---
+
+var (
+	_ fyne.Tappable          = (*interactiveScreen)(nil)
+	_ fyne.SecondaryTappable = (*interactiveScreen)(nil)
+	_ fyne.Draggable         = (*interactiveScreen)(nil)
+	_ fyne.Focusable         = (*interactiveScreen)(nil)
+	_ desktop.Hoverable      = (*interactiveScreen)(nil)
+	_ desktop.Keyable        = (*interactiveScreen)(nil)
+)
+
+// --- Focus ---
+
+func (s *interactiveScreen) FocusGained() {
+	s.mu.Lock()
+	s.focused = true
+	s.mu.Unlock()
+}
+
+func (s *interactiveScreen) FocusLost() {
+	s.mu.Lock()
+	s.focused = false
+	s.mu.Unlock()
+}
+
+func (s *interactiveScreen) TypedRune(r rune) {
+	if k, ok := runeToKey(r); ok {
+		s.client.SendKeyEvent(uint16(k), true)
+		s.client.SendKeyEvent(uint16(k), false)
+	}
+}
+
+func (s *interactiveScreen) TypedKey(ev *fyne.KeyEvent) {
+	// TypedKey fires on press. We send press+release for keys that
+	// don't come through KeyDown/KeyUp on all platforms.
+	if k, ok := fyneKeyMap[ev.Name]; ok {
+		s.client.SendKeyEvent(uint16(k), true)
+		s.client.SendKeyEvent(uint16(k), false)
+	}
+}
+
+// --- desktop.Keyable: separate key down/up for desktop platforms ---
+
+func (s *interactiveScreen) KeyDown(ev *fyne.KeyEvent) {
+	if k, ok := fyneKeyMap[ev.Name]; ok {
+		s.client.SendKeyEvent(uint16(k), true)
+	}
+}
+
+func (s *interactiveScreen) KeyUp(ev *fyne.KeyEvent) {
+	if k, ok := fyneKeyMap[ev.Name]; ok {
+		s.client.SendKeyEvent(uint16(k), false)
+	}
+}
+
+// --- Mouse: Tap ---
 
 func (s *interactiveScreen) Tapped(ev *fyne.PointEvent) {
+	// Request focus on click.
+	c := fyne.CurrentApp().Driver().CanvasForObject(s)
+	if c != nil {
+		c.Focus(s)
+	}
 	nx, ny := s.normalize(ev.Position)
 	s.client.SendMouseButton(nx, ny, 0, true)
 	s.client.SendMouseButton(nx, ny, 0, false)
@@ -92,14 +146,17 @@ func (s *interactiveScreen) TappedSecondary(ev *fyne.PointEvent) {
 	s.client.SendMouseButton(nx, ny, 1, false)
 }
 
-func (s *interactiveScreen) MouseIn(ev *desktop.MouseEvent) {}
+// --- Mouse: Hover ---
 
-func (s *interactiveScreen) MouseOut() {}
+func (s *interactiveScreen) MouseIn(ev *desktop.MouseEvent) {}
+func (s *interactiveScreen) MouseOut()                      {}
 
 func (s *interactiveScreen) MouseMoved(ev *desktop.MouseEvent) {
 	nx, ny := s.normalize(ev.Position)
 	s.client.SendMouseMove(nx, ny)
 }
+
+// --- Mouse: Drag ---
 
 func (s *interactiveScreen) Dragged(ev *fyne.DragEvent) {
 	nx, ny := s.normalize(ev.Position)
@@ -108,9 +165,10 @@ func (s *interactiveScreen) Dragged(ev *fyne.DragEvent) {
 
 func (s *interactiveScreen) DragEnd() {}
 
+// --- Mouse: Scroll ---
+
 func (s *interactiveScreen) Scrolled(ev *fyne.ScrollEvent) {
-	dy := 0.0
-	dx := 0.0
+	var dy, dx float64
 	if ev.Scrolled.DY > 0 {
 		dy = 1
 	} else if ev.Scrolled.DY < 0 {
@@ -122,6 +180,44 @@ func (s *interactiveScreen) Scrolled(ev *fyne.ScrollEvent) {
 		dx = -1
 	}
 	s.client.SendMouseScroll(0.5, 0.5, dx, dy)
+}
+
+// --- Rune to Key mapping for TypedRune ---
+
+func runeToKey(r rune) (input.Key, bool) {
+	switch {
+	case r >= 'a' && r <= 'z':
+		return input.KeyA + input.Key(r-'a'), true
+	case r >= 'A' && r <= 'Z':
+		return input.KeyA + input.Key(r-'A'), true
+	case r >= '0' && r <= '9':
+		return input.Key0 + input.Key(r-'0'), true
+	case r == ' ':
+		return input.KeySpace, true
+	case r == '-' || r == '_':
+		return input.KeyMinus, true
+	case r == '=' || r == '+':
+		return input.KeyEqual, true
+	case r == '[' || r == '{':
+		return input.KeyLeftBracket, true
+	case r == ']' || r == '}':
+		return input.KeyRightBracket, true
+	case r == '\\' || r == '|':
+		return input.KeyBackslash, true
+	case r == ';' || r == ':':
+		return input.KeySemicolon, true
+	case r == '\'' || r == '"':
+		return input.KeyApostrophe, true
+	case r == '`' || r == '~':
+		return input.KeyGraveAccent, true
+	case r == ',' || r == '<':
+		return input.KeyComma, true
+	case r == '.' || r == '>':
+		return input.KeyPeriod, true
+	case r == '/' || r == '?':
+		return input.KeySlash, true
+	}
+	return 0, false
 }
 
 // --- Renderer ---

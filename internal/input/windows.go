@@ -3,15 +3,16 @@
 package input
 
 import (
+	"encoding/binary"
 	"fmt"
 	"syscall"
 	"unsafe"
 )
 
 var (
-	user32          = syscall.NewLazyDLL("user32.dll")
-	procSendInput   = user32.NewProc("SendInput")
-	procSetCursorPos = user32.NewProc("SetCursorPos")
+	user32               = syscall.NewLazyDLL("user32.dll")
+	procSendInput        = user32.NewProc("SendInput")
+	procSetCursorPos     = user32.NewProc("SetCursorPos")
 	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 )
 
@@ -19,45 +20,46 @@ const (
 	inputMouse    = 0
 	inputKeyboard = 1
 
-	mousefAbsolute       = 0x8000
-	mousefMove           = 0x0001
-	mousefLeftDown       = 0x0002
-	mousefLeftUp         = 0x0004
-	mousefRightDown      = 0x0008
-	mousefRightUp        = 0x0010
-	mousefMiddleDown     = 0x0020
-	mousefMiddleUp       = 0x0040
-	mousefWheel          = 0x0800
-	mousefHWheel         = 0x01000
+	mousefAbsolute  = 0x8000
+	mousefMove      = 0x0001
+	mousefLeftDown  = 0x0002
+	mousefLeftUp    = 0x0004
+	mousefRightDown = 0x0008
+	mousefRightUp   = 0x0010
+	mousefMiddleDown = 0x0020
+	mousefMiddleUp  = 0x0040
+	mousefWheel     = 0x0800
+	mousefHWheel    = 0x01000
 
 	keyfExtendedKey = 0x0001
 	keyfKeyUp       = 0x0002
-	keyfScanCode    = 0x0008
 
 	wheelDelta = 120
+
+	// Windows INPUT struct layout on AMD64:
+	//   offset 0:  DWORD  type        (4 bytes)
+	//   offset 4:  padding             (4 bytes, alignment for union)
+	//   offset 8:  union data          (32 bytes, sizeof MOUSEINPUT on x64)
+	//   total: 40 bytes
+	//
+	// MOUSEINPUT on AMD64 (32 bytes at offset 8):
+	//   offset  8: LONG      dx          (4 bytes)
+	//   offset 12: LONG      dy          (4 bytes)
+	//   offset 16: DWORD     mouseData   (4 bytes)
+	//   offset 20: DWORD     dwFlags     (4 bytes)
+	//   offset 24: DWORD     time        (4 bytes)
+	//   offset 28: padding               (4 bytes)
+	//   offset 32: ULONG_PTR dwExtraInfo (8 bytes)
+	//
+	// KEYBDINPUT on AMD64 (24 bytes at offset 8):
+	//   offset  8: WORD      wVk         (2 bytes)
+	//   offset 10: WORD      wScan       (2 bytes)
+	//   offset 12: DWORD     dwFlags     (4 bytes)
+	//   offset 16: DWORD     time        (4 bytes)
+	//   offset 20: padding               (4 bytes)
+	//   offset 24: ULONG_PTR dwExtraInfo (8 bytes)
+	inputSize = 40 // sizeof(INPUT) on Windows AMD64
 )
-
-type mouseInput struct {
-	dx, dy    int32
-	mouseData uint32
-	flags     uint32
-	time      uint32
-	extraInfo uintptr
-}
-
-type keybdInput struct {
-	wVk         uint16
-	wScan       uint16
-	dwFlags     uint32
-	time        uint32
-	dwExtraInfo uintptr
-}
-
-type tagInput struct {
-	inputType uint32
-	padding   [2]byte // alignment
-	mi        [24]byte
-}
 
 var keyToVK = map[Key]uint16{
 	KeyA: 0x41, KeyB: 0x42, KeyC: 0x43, KeyD: 0x44, KeyE: 0x45,
@@ -102,6 +104,8 @@ var extendedKeys = map[uint16]bool{
 	0x5B: true, 0x5C: true, // win keys
 	0xA3: true, 0xA5: true, // right ctrl, right alt
 	0x2C: true, // print screen
+	0x6F: true, // numpad divide
+	0x0D: true, // numpad enter (shares VK with Return, extended distinguishes)
 }
 
 type windowsInjector struct {
@@ -134,19 +138,19 @@ func (inj *windowsInjector) MouseMove(x, y int) error {
 func (inj *windowsInjector) MouseButton(button uint8, pressed bool) error {
 	var flags uint32
 	switch button {
-	case 0: // left
+	case 0:
 		if pressed {
 			flags = mousefLeftDown
 		} else {
 			flags = mousefLeftUp
 		}
-	case 1: // right
+	case 1:
 		if pressed {
 			flags = mousefRightDown
 		} else {
 			flags = mousefRightUp
 		}
-	case 2: // middle
+	case 2:
 		if pressed {
 			flags = mousefMiddleDown
 		} else {
@@ -155,31 +159,57 @@ func (inj *windowsInjector) MouseButton(button uint8, pressed bool) error {
 	default:
 		return fmt.Errorf("unknown button: %d", button)
 	}
-	return inj.sendMouseInput(0, 0, 0, flags)
+	return sendMouseInputWin(0, 0, 0, flags)
 }
 
 func (inj *windowsInjector) MouseScroll(dx, dy int) error {
 	if dy != 0 {
-		if err := inj.sendMouseInput(0, 0, uint32(int32(dy*wheelDelta)), mousefWheel); err != nil {
+		if err := sendMouseInputWin(0, 0, uint32(int32(dy*wheelDelta)), mousefWheel); err != nil {
 			return err
 		}
 	}
 	if dx != 0 {
-		if err := inj.sendMouseInput(0, 0, uint32(int32(dx*wheelDelta)), mousefHWheel); err != nil {
+		if err := sendMouseInputWin(0, 0, uint32(int32(dx*wheelDelta)), mousefHWheel); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (inj *windowsInjector) sendMouseInput(dx, dy int32, data, flags uint32) error {
-	mi := mouseInput{dx: dx, dy: dy, mouseData: data, flags: flags}
-	var inp tagInput
-	inp.inputType = inputMouse
-	*(*mouseInput)(unsafe.Pointer(&inp.mi)) = mi
-	ret, _, _ := procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), unsafe.Sizeof(inp))
+// sendMouseInputWin constructs a Windows INPUT struct with correct ABI layout
+// and calls SendInput.
+func sendMouseInputWin(dx, dy int32, mouseData, flags uint32) error {
+	var buf [inputSize]byte
+	// Type at offset 0
+	binary.LittleEndian.PutUint32(buf[0:4], inputMouse)
+	// MOUSEINPUT union at offset 8
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(dx))
+	binary.LittleEndian.PutUint32(buf[12:16], uint32(dy))
+	binary.LittleEndian.PutUint32(buf[16:20], mouseData)
+	binary.LittleEndian.PutUint32(buf[20:24], flags)
+	// time = 0 (offset 24), dwExtraInfo = 0 (offset 32) — already zeroed
+
+	ret, _, _ := procSendInput.Call(1, uintptr(unsafe.Pointer(&buf[0])), uintptr(inputSize))
 	if ret == 0 {
 		return fmt.Errorf("SendInput mouse failed")
+	}
+	return nil
+}
+
+// sendKeyInputWin constructs a KEYBDINPUT and calls SendInput.
+func sendKeyInputWin(vk uint16, flags uint32) error {
+	var buf [inputSize]byte
+	// Type at offset 0
+	binary.LittleEndian.PutUint32(buf[0:4], inputKeyboard)
+	// KEYBDINPUT union at offset 8
+	binary.LittleEndian.PutUint16(buf[8:10], vk)    // wVk
+	// wScan = 0 (offset 10) — already zeroed
+	binary.LittleEndian.PutUint32(buf[12:16], flags) // dwFlags
+	// time = 0 (offset 16), dwExtraInfo = 0 (offset 24) — already zeroed
+
+	ret, _, _ := procSendInput.Call(1, uintptr(unsafe.Pointer(&buf[0])), uintptr(inputSize))
+	if ret == 0 {
+		return fmt.Errorf("SendInput keyboard failed")
 	}
 	return nil
 }
@@ -196,16 +226,7 @@ func (inj *windowsInjector) KeyPress(key Key, pressed bool) error {
 	if !pressed {
 		flags |= keyfKeyUp
 	}
-
-	ki := keybdInput{wVk: vk, dwFlags: flags}
-	var inp tagInput
-	inp.inputType = inputKeyboard
-	*(*keybdInput)(unsafe.Pointer(&inp.mi)) = ki
-	ret, _, _ := procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), unsafe.Sizeof(inp))
-	if ret == 0 {
-		return fmt.Errorf("SendInput keyboard failed")
-	}
-	return nil
+	return sendKeyInputWin(vk, flags)
 }
 
 func (inj *windowsInjector) SendSpecialCombo(combo uint8) error {

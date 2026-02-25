@@ -72,12 +72,18 @@ func (a *App) showHostScreen() {
 	portEntry := widget.NewEntry()
 	portEntry.SetText(strconv.Itoa(cfg.Port))
 
+	var srv *server.Server
+	var startBtn *widget.Button
+
 	// -- Quality / FPS --
 	qualitySlider := widget.NewSlider(10, 100)
 	qualitySlider.SetValue(float64(cfg.Quality))
 	qualityLabel := widget.NewLabel(fmt.Sprintf("Quality: %d%%", cfg.Quality))
 	qualitySlider.OnChanged = func(v float64) {
 		qualityLabel.SetText(fmt.Sprintf("Quality: %d%%", int(v)))
+		if srv != nil && srv.IsRunning() {
+			srv.SetQuality(int(v))
+		}
 	}
 
 	fpsSlider := widget.NewSlider(1, 60)
@@ -85,7 +91,15 @@ func (a *App) showHostScreen() {
 	fpsLabel := widget.NewLabel(fmt.Sprintf("Max FPS: %d", cfg.MaxFPS))
 	fpsSlider.OnChanged = func(v float64) {
 		fpsLabel.SetText(fmt.Sprintf("Max FPS: %d", int(v)))
+		if srv != nil && srv.IsRunning() {
+			srv.SetMaxFPS(int(v))
+		}
 	}
+
+	// -- Receive directory --
+	recvDirLabel := widget.NewLabel(fmt.Sprintf("Receive dir: %s", cfg.ReceiveDir))
+	recvDirLabel.Wrapping = fyne.TextWrapWord
+	recvDirLabel.TextStyle = fyne.TextStyle{Italic: true}
 
 	// -- Status area --
 	statusLabel := widget.NewLabel("Status: Stopped")
@@ -93,9 +107,6 @@ func (a *App) showHostScreen() {
 
 	ipLabel := widget.NewLabel(fmt.Sprintf("Local IP: %s", discovery.GetLocalIP()))
 	clientsLabel := widget.NewLabel("Connected clients: 0")
-
-	var srv *server.Server
-	var startBtn *widget.Button
 
 	startBtn = widget.NewButton("Start Sharing", func() {
 		if srv != nil && srv.IsRunning() {
@@ -142,6 +153,9 @@ func (a *App) showHostScreen() {
 			dialog.ShowInformation("File Received",
 				fmt.Sprintf("Received: %s (%s)", name, formatSize(size)),
 				a.mainWindow)
+		}
+		srv.OnClipboardReceived = func(text string) {
+			a.mainWindow.Clipboard().SetContent(text)
 		}
 
 		if err := srv.Start(); err != nil {
@@ -190,6 +204,7 @@ func (a *App) showHostScreen() {
 		statusLabel,
 		ipLabel,
 		clientsLabel,
+		recvDirLabel,
 	)
 
 	content := container.NewVBox(

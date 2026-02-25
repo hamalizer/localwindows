@@ -38,11 +38,12 @@ type Client struct {
 	frameID  uint32
 
 	// Callbacks
-	OnFrameUpdate func(*image.RGBA)
-	OnDisconnect  func(error)
-	OnFileOffer   func(protocol.FileOffer)
+	OnFrameUpdate  func(*image.RGBA)
+	OnDisconnect   func(error)
+	OnFileOffer    func(protocol.FileOffer)
 	OnFileProgress func(transferID string, received, total int64)
-	OnFileDone    func(transferID string)
+	OnFileDone     func(transferID string)
+	OnClipboard    func(text string)
 }
 
 // ConnectConfig holds connection parameters.
@@ -174,7 +175,10 @@ func (c *Client) receiveLoop() {
 				c.OnFileDone(done.TransferID)
 			}
 		case protocol.MsgClipboard:
-			// Future clipboard sync
+			var clip protocol.ClipboardMsg
+			if err := protocol.DecodeJSON(payload, &clip); err == nil && c.OnClipboard != nil {
+				c.OnClipboard(clip.Text)
+			}
 		case protocol.MsgPong:
 			// Keepalive response
 		case protocol.MsgDisconnect:

@@ -6,6 +6,8 @@ import (
 	"log"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -21,7 +23,7 @@ import (
 	"localwindows/internal/transfer"
 )
 
-// Fyne key name → our input.Key mapping.
+// Fyne key name -> our input.Key mapping.
 var fyneKeyMap = map[fyne.KeyName]input.Key{
 	fyne.KeyA: input.KeyA, fyne.KeyB: input.KeyB, fyne.KeyC: input.KeyC,
 	fyne.KeyD: input.KeyD, fyne.KeyE: input.KeyE, fyne.KeyF: input.KeyF,
@@ -50,22 +52,34 @@ var fyneKeyMap = map[fyne.KeyName]input.Key{
 	fyne.KeyInsert: input.KeyInsert,
 }
 
+// Preferences keys.
+const (
+	prefLastHost = "last_host"
+	prefLastPort = "last_port"
+	prefLastAuth = "last_auth"
+)
+
 func (a *App) showViewerScreen() {
 	a.mainWindow.SetTitle("LocalWindows - Viewer Mode")
-	a.mainWindow.Resize(fyne.NewSize(550, 500))
+	a.mainWindow.Resize(fyne.NewSize(550, 520))
+
+	prefs := a.fyneApp.Preferences()
 
 	// -- Connection form --
 	hostEntry := widget.NewEntry()
 	hostEntry.SetPlaceHolder("Host IP address")
+	if saved := prefs.String(prefLastHost); saved != "" {
+		hostEntry.SetText(saved)
+	}
 
 	portEntry := widget.NewEntry()
-	portEntry.SetText(strconv.Itoa(19283))
+	portEntry.SetText(prefs.StringWithFallback(prefLastPort, "19283"))
 
 	credEntry := widget.NewPasswordEntry()
 	credEntry.SetPlaceHolder("Password or PIN")
 
 	authModeSelect := widget.NewSelect([]string{"Password", "PIN"}, nil)
-	authModeSelect.SetSelected("Password")
+	authModeSelect.SetSelected(prefs.StringWithFallback(prefLastAuth, "Password"))
 
 	// -- Discovery list --
 	discoveredHosts := widget.NewList(
@@ -116,6 +130,13 @@ func (a *App) showViewerScreen() {
 	// Start discovery listener.
 	listener := discovery.NewListener(func(h discovery.Host) {
 		hostsMu.Lock()
+		// Deduplicate.
+		for _, existing := range hosts {
+			if existing.IP == h.IP && existing.Port == h.Port {
+				hostsMu.Unlock()
+				return
+			}
+		}
 		hosts = append(hosts, h)
 		hostsMu.Unlock()
 		refreshList()
@@ -159,6 +180,11 @@ func (a *App) showViewerScreen() {
 		if authModeSelect.Selected == "PIN" {
 			authMode = protocol.AuthPIN
 		}
+
+		// Save connection preferences.
+		prefs.SetString(prefLastHost, host)
+		prefs.SetString(prefLastPort, portEntry.Text)
+		prefs.SetString(prefLastAuth, authModeSelect.Selected)
 
 		statusLabel.SetText("Status: Connecting...")
 		connectBtn.Disable()
@@ -225,6 +251,22 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 	rw, rh := cl.ScreenSize()
 	a.mainWindow.SetTitle(fmt.Sprintf("LocalWindows - Remote Desktop (%dx%d)", rw, rh))
 
+	// Frame counter for FPS display.
+	var frameCount atomic.Int64
+	fpsLabel := widget.NewLabel("FPS: --")
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			if !cl.IsConnected() {
+				return
+			}
+			count := frameCount.Swap(0)
+			fpsLabel.SetText(fmt.Sprintf("FPS: %d", count))
+		}
+	}()
+
 	// Create the remote screen image.
 	screenImg := canvas.NewImageFromImage(image.NewRGBA(image.Rect(0, 0, rw, rh)))
 	screenImg.FillMode = canvas.ImageFillContain
@@ -232,8 +274,14 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 
 	// Update the image on new frames.
 	cl.OnFrameUpdate = func(frame *image.RGBA) {
+		frameCount.Add(1)
 		screenImg.Image = frame
 		canvas.Refresh(screenImg)
+	}
+
+	// Handle clipboard from server.
+	cl.OnClipboard = func(text string) {
+		a.mainWindow.Clipboard().SetContent(text)
 	}
 
 	// Handle disconnect.
@@ -243,6 +291,7 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 			msg = fmt.Sprintf("Connection lost: %v", err)
 		}
 		dialog.ShowInformation("Disconnected", msg, a.mainWindow)
+		a.mainWindow.SetFullScreen(false)
 		a.showViewerScreen()
 	}
 
@@ -258,6 +307,32 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 			dialog.ShowError(fmt.Errorf("transfer error: %v", err), a.mainWindow)
 		},
 	)
+
+	// -- Clipboard sync --
+	clipboardSyncing := false
+	var clipBtn *widget.Button
+	clipBtn = widget.NewButton("Clip Sync: Off", func() {
+		clipboardSyncing = !clipboardSyncing
+		if clipboardSyncing {
+			clipBtn.SetText("Clip Sync: On")
+			go syncClipboard(cl, a.mainWindow)
+		} else {
+			clipBtn.SetText("Clip Sync: Off")
+		}
+	})
+
+	// -- Fullscreen toggle --
+	isFullScreen := false
+	var fullscreenBtn *widget.Button
+	fullscreenBtn = widget.NewButton("Fullscreen", func() {
+		isFullScreen = !isFullScreen
+		a.mainWindow.SetFullScreen(isFullScreen)
+		if isFullScreen {
+			fullscreenBtn.SetText("Exit Fullscreen")
+		} else {
+			fullscreenBtn.SetText("Fullscreen")
+		}
+	})
 
 	// -- Toolbar --
 	ctrlAltDelBtn := widget.NewButton("Ctrl+Alt+Del", func() {
@@ -288,6 +363,7 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 	})
 
 	disconnectBtn := widget.NewButton("Disconnect", func() {
+		a.mainWindow.SetFullScreen(false)
 		cl.Disconnect()
 		a.showViewerScreen()
 	})
@@ -295,34 +371,49 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 
 	toolbar := container.NewHBox(
 		ctrlAltDelBtn, altTabBtn, winDBtn,
+		widget.NewSeparator(),
+		clipBtn, fullscreenBtn,
 		layout.NewSpacer(),
+		fpsLabel,
+		widget.NewSeparator(),
 		sendFileBtn,
 		disconnectBtn,
 	)
 
-	// -- Mouse/keyboard event handling --
-	// We wrap the image in a custom interactive container.
-	interactiveScreen := newInteractiveScreen(screenImg, cl, rw, rh)
+	// -- Interactive remote screen --
+	screen := newInteractiveScreen(screenImg, cl, rw, rh)
 
 	content := container.NewBorder(
-		toolbar,  // top
-		nil,      // bottom
-		nil,      // left
-		nil,      // right
-		interactiveScreen,
+		toolbar, // top
+		nil,     // bottom
+		nil,     // left
+		nil,     // right
+		screen,
 	)
 
 	a.mainWindow.SetContent(content)
 	a.mainWindow.Resize(fyne.NewSize(
 		float32(min(rw, 1280)),
-		float32(min(rh, 800))+40,
+		float32(min(rh, 800))+50,
 	))
 
-	// Register keyboard handler.
-	a.mainWindow.Canvas().SetOnTypedKey(func(ev *fyne.KeyEvent) {
-		if k, ok := fyneKeyMap[ev.Name]; ok {
-			cl.SendKeyEvent(uint16(k), true)
-			cl.SendKeyEvent(uint16(k), false)
+	// Focus the interactive screen so it receives keyboard events.
+	a.mainWindow.Canvas().Focus(screen)
+}
+
+// syncClipboard periodically sends the local clipboard to the remote host.
+func syncClipboard(cl *client.Client, win fyne.Window) {
+	var lastClip string
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !cl.IsConnected() {
+			return
 		}
-	})
+		clip := win.Clipboard().Content()
+		if clip != "" && clip != lastClip {
+			lastClip = clip
+			cl.SendClipboard(clip)
+		}
+	}
 }
