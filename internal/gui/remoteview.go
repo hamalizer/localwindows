@@ -2,6 +2,7 @@ package gui
 
 import (
 	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -11,6 +12,8 @@ import (
 	"localwindows/internal/client"
 	"localwindows/internal/input"
 )
+
+const mouseMoveMinInterval = 8 * time.Millisecond // ~120 Hz max mouse rate
 
 // interactiveScreen wraps a screen image with full mouse and keyboard handling.
 type interactiveScreen struct {
@@ -23,8 +26,9 @@ type interactiveScreen struct {
 	// hasKeyable tracks whether KeyDown has been called at least once,
 	// indicating desktop.Keyable is active. When true, TypedKey/TypedRune
 	// are suppressed to avoid double-firing key events.
-	hasKeyable bool
-	mu         sync.Mutex
+	hasKeyable    bool
+	lastMouseSend time.Time // throttle mouse moves
+	mu            sync.Mutex
 }
 
 func newInteractiveScreen(img *canvas.Image, cl *client.Client, rw, rh int) *interactiveScreen {
@@ -172,6 +176,14 @@ func (s *interactiveScreen) MouseIn(ev *desktop.MouseEvent) {}
 func (s *interactiveScreen) MouseOut()                      {}
 
 func (s *interactiveScreen) MouseMoved(ev *desktop.MouseEvent) {
+	now := time.Now()
+	s.mu.Lock()
+	if now.Sub(s.lastMouseSend) < mouseMoveMinInterval {
+		s.mu.Unlock()
+		return
+	}
+	s.lastMouseSend = now
+	s.mu.Unlock()
 	nx, ny := s.normalize(ev.Position)
 	s.client.SendMouseMove(nx, ny)
 }
@@ -179,6 +191,14 @@ func (s *interactiveScreen) MouseMoved(ev *desktop.MouseEvent) {
 // --- Mouse: Drag ---
 
 func (s *interactiveScreen) Dragged(ev *fyne.DragEvent) {
+	now := time.Now()
+	s.mu.Lock()
+	if now.Sub(s.lastMouseSend) < mouseMoveMinInterval {
+		s.mu.Unlock()
+		return
+	}
+	s.lastMouseSend = now
+	s.mu.Unlock()
 	nx, ny := s.normalize(ev.Position)
 	s.client.SendMouseMove(nx, ny)
 }

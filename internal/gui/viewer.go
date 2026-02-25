@@ -205,6 +205,7 @@ func (a *App) showViewerScreen() {
 				return
 			}
 
+			a.activeClient = cl
 			listener.Stop()
 			connectBtn.Enable()
 			a.showRemoteDesktop(cl)
@@ -290,6 +291,7 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 		if err != nil {
 			msg = fmt.Sprintf("Connection lost: %v", err)
 		}
+		a.activeClient = nil
 		dialog.ShowInformation("Disconnected", msg, a.mainWindow)
 		a.mainWindow.SetFullScreen(false)
 		a.showViewerScreen()
@@ -369,6 +371,7 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 	disconnectBtn := widget.NewButton("Disconnect", func() {
 		a.mainWindow.SetFullScreen(false)
 		cl.Disconnect()
+		a.activeClient = nil
 		a.showViewerScreen()
 	})
 	disconnectBtn.Importance = widget.DangerImportance

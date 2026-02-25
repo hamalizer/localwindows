@@ -113,6 +113,7 @@ func (a *App) showHostScreen() {
 			// Stop
 			srv.Stop()
 			srv = nil
+			a.activeServer = nil
 			statusLabel.SetText("Status: Stopped")
 			clientsLabel.SetText("Connected clients: 0")
 			startBtn.SetText("Start Sharing")
@@ -140,6 +141,7 @@ func (a *App) showHostScreen() {
 		cfg.MaxFPS = int(fpsSlider.Value)
 
 		srv = server.New(authMgr, cfg)
+		a.activeServer = srv
 		srv.OnClientConnect = func(addr string) {
 			clientsLabel.SetText(fmt.Sprintf("Connected clients: %d", srv.ClientCount()))
 		}
@@ -176,6 +178,7 @@ func (a *App) showHostScreen() {
 				"Stopping will disconnect all viewers.", func(ok bool) {
 					if ok {
 						srv.Stop()
+						a.activeServer = nil
 						a.showModeSelector()
 					}
 				}, a.mainWindow)

@@ -1,1 +1,25 @@
+# Build artifacts
 localwindows
+localwindows.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Coverage
+coverage.out
+coverage.html
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

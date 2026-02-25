@@ -81,11 +81,15 @@ type Server struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 
+	// Per-server file transfer state.
+	fileTransfers   map[string]*fileTransferState
+	fileTransfersMu sync.Mutex
+
 	// Callbacks
-	OnClientConnect    func(addr string)
-	OnClientDisconnect func(addr string)
-	OnError            func(err error)
-	OnFileReceived     func(name string, size int64)
+	OnClientConnect     func(addr string)
+	OnClientDisconnect  func(addr string)
+	OnError             func(err error)
+	OnFileReceived      func(name string, size int64)
 	OnClipboardReceived func(text string)
 }
 
@@ -98,9 +102,10 @@ type clientConn struct {
 // New creates a new server with the given auth manager and config.
 func New(authMgr *auth.Manager, cfg Config) *Server {
 	return &Server{
-		config:  cfg,
-		auth:    authMgr,
-		clients: make(map[string]*clientConn),
+		config:        cfg,
+		auth:          authMgr,
+		clients:       make(map[string]*clientConn),
+		fileTransfers: make(map[string]*fileTransferState),
 	}
 }
 
@@ -264,13 +269,31 @@ func (s *Server) handleClient(raw net.Conn) {
 	}
 }
 
+// quality returns the current JPEG quality, safe for concurrent reads.
+func (s *Server) quality() int {
+	s.mu.RLock()
+	q := s.config.Quality
+	s.mu.RUnlock()
+	return q
+}
+
+// maxFPS returns the current max FPS, safe for concurrent reads.
+func (s *Server) maxFPS() int {
+	s.mu.RLock()
+	fps := s.config.MaxFPS
+	s.mu.RUnlock()
+	return fps
+}
+
 func (s *Server) streamFrames(ctx context.Context, conn *protocol.Conn) {
-	interval := time.Duration(1000/s.config.MaxFPS) * time.Millisecond
+	fps := s.maxFPS()
+	interval := time.Duration(1000/fps) * time.Millisecond
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	var prevHashes []uint64
 	var frameID uint32
+	var lastFPS int = fps
 
 	for {
 		select {
@@ -279,10 +302,19 @@ func (s *Server) streamFrames(ctx context.Context, conn *protocol.Conn) {
 		case <-ticker.C:
 		}
 
+		// Adapt ticker if FPS setting changed.
+		curFPS := s.maxFPS()
+		if curFPS != lastFPS {
+			lastFPS = curFPS
+			ticker.Reset(time.Duration(1000/curFPS) * time.Millisecond)
+		}
+
 		frame, err := s.capturer.Capture()
 		if err != nil {
 			continue
 		}
+
+		quality := s.quality()
 
 		frameID++
 		bounds := frame.Rect
@@ -310,8 +342,8 @@ func (s *Server) streamFrames(ctx context.Context, conn *protocol.Conn) {
 			frameID%fullFrameInterval == 0
 
 		if sendFull {
-			jpegData := encodeJPEG(frame, s.config.Quality)
-			payload := protocol.EncodeFullFrame(frameID, w, h, uint8(s.config.Quality), jpegData)
+			jpegData := encodeJPEG(frame, quality)
+			payload := protocol.EncodeFullFrame(frameID, w, h, uint8(quality), jpegData)
 			if err := conn.WriteMessage(protocol.MsgFrameFull, payload); err != nil {
 				return
 			}
@@ -330,7 +362,7 @@ func (s *Server) streamFrames(ctx context.Context, conn *protocol.Conn) {
 						tiles = append(tiles, protocol.Tile{
 							X: x0, Y: y0,
 							W: x1 - x0, H: y1 - y0,
-							Data: encodeJPEG(sub, s.config.Quality),
+							Data: encodeJPEG(sub, quality),
 						})
 					}
 				}
@@ -341,8 +373,8 @@ func (s *Server) streamFrames(ctx context.Context, conn *protocol.Conn) {
 			}
 			// If more than half changed, send full frame instead.
 			if len(tiles) > totalTiles/2 {
-				jpegData := encodeJPEG(frame, s.config.Quality)
-				payload := protocol.EncodeFullFrame(frameID, w, h, uint8(s.config.Quality), jpegData)
+				jpegData := encodeJPEG(frame, quality)
+				payload := protocol.EncodeFullFrame(frameID, w, h, uint8(quality), jpegData)
 				if err := conn.WriteMessage(protocol.MsgFrameFull, payload); err != nil {
 					return
 				}
@@ -438,17 +470,11 @@ func (s *Server) handleInputEvents(ctx context.Context, conn *protocol.Conn) {
 	}
 }
 
-// File transfer state per client
-var (
-	fileTransfers   = make(map[string]*fileTransferState)
-	fileTransfersMu sync.Mutex
-)
-
 type fileTransferState struct {
-	fileName  string
-	fileSize  int64
-	received  int64
-	file      *os.File
+	fileName string
+	fileSize int64
+	received int64
+	file     *os.File
 }
 
 func (s *Server) handleFileOffer(conn *protocol.Conn, payload []byte) {
@@ -469,13 +495,13 @@ func (s *Server) handleFileOffer(conn *protocol.Conn, payload []byte) {
 		return
 	}
 
-	fileTransfersMu.Lock()
-	fileTransfers[offer.TransferID] = &fileTransferState{
+	s.fileTransfersMu.Lock()
+	s.fileTransfers[offer.TransferID] = &fileTransferState{
 		fileName: offer.FileName,
 		fileSize: offer.FileSize,
 		file:     f,
 	}
-	fileTransfersMu.Unlock()
+	s.fileTransfersMu.Unlock()
 
 	conn.WriteJSONMessage(protocol.MsgFileAccept, protocol.FileAcceptMsg{
 		TransferID: offer.TransferID,
@@ -487,9 +513,9 @@ func (s *Server) handleFileChunk(payload []byte) {
 	if err != nil {
 		return
 	}
-	fileTransfersMu.Lock()
-	state, ok := fileTransfers[transferID]
-	fileTransfersMu.Unlock()
+	s.fileTransfersMu.Lock()
+	state, ok := s.fileTransfers[transferID]
+	s.fileTransfersMu.Unlock()
 	if !ok {
 		return
 	}
@@ -502,13 +528,13 @@ func (s *Server) handleFileDone(payload []byte) {
 	if err := protocol.DecodeJSON(payload, &msg); err != nil {
 		return
 	}
-	fileTransfersMu.Lock()
-	state, ok := fileTransfers[msg.TransferID]
+	s.fileTransfersMu.Lock()
+	state, ok := s.fileTransfers[msg.TransferID]
 	if ok {
 		state.file.Close()
-		delete(fileTransfers, msg.TransferID)
+		delete(s.fileTransfers, msg.TransferID)
 	}
-	fileTransfersMu.Unlock()
+	s.fileTransfersMu.Unlock()
 
 	if ok && s.OnFileReceived != nil {
 		s.OnFileReceived(state.fileName, state.received)
