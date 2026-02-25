@@ -20,7 +20,11 @@ type interactiveScreen struct {
 	remoteW int
 	remoteH int
 	focused bool
-	mu      sync.Mutex
+	// hasKeyable tracks whether KeyDown has been called at least once,
+	// indicating desktop.Keyable is active. When true, TypedKey/TypedRune
+	// are suppressed to avoid double-firing key events.
+	hasKeyable bool
+	mu         sync.Mutex
 }
 
 func newInteractiveScreen(img *canvas.Image, cl *client.Client, rw, rh int) *interactiveScreen {
@@ -98,6 +102,13 @@ func (s *interactiveScreen) FocusLost() {
 }
 
 func (s *interactiveScreen) TypedRune(r rune) {
+	// On desktop, KeyDown/KeyUp handles all keys — skip to avoid double-fire.
+	s.mu.Lock()
+	skip := s.hasKeyable
+	s.mu.Unlock()
+	if skip {
+		return
+	}
 	if k, ok := runeToKey(r); ok {
 		s.client.SendKeyEvent(uint16(k), true)
 		s.client.SendKeyEvent(uint16(k), false)
@@ -105,8 +116,14 @@ func (s *interactiveScreen) TypedRune(r rune) {
 }
 
 func (s *interactiveScreen) TypedKey(ev *fyne.KeyEvent) {
-	// TypedKey fires on press. We send press+release for keys that
-	// don't come through KeyDown/KeyUp on all platforms.
+	// On desktop, KeyDown/KeyUp handles all keys — skip to avoid double-fire.
+	s.mu.Lock()
+	skip := s.hasKeyable
+	s.mu.Unlock()
+	if skip {
+		return
+	}
+	// Fallback for platforms without desktop.Keyable: send press+release.
 	if k, ok := fyneKeyMap[ev.Name]; ok {
 		s.client.SendKeyEvent(uint16(k), true)
 		s.client.SendKeyEvent(uint16(k), false)
@@ -116,6 +133,9 @@ func (s *interactiveScreen) TypedKey(ev *fyne.KeyEvent) {
 // --- desktop.Keyable: separate key down/up for desktop platforms ---
 
 func (s *interactiveScreen) KeyDown(ev *fyne.KeyEvent) {
+	s.mu.Lock()
+	s.hasKeyable = true
+	s.mu.Unlock()
 	if k, ok := fyneKeyMap[ev.Name]; ok {
 		s.client.SendKeyEvent(uint16(k), true)
 	}

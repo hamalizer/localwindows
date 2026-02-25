@@ -308,16 +308,20 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 		},
 	)
 
-	// -- Clipboard sync --
-	clipboardSyncing := false
+	// -- Clipboard sync with cancellation --
+	var clipStop chan struct{}
 	var clipBtn *widget.Button
 	clipBtn = widget.NewButton("Clip Sync: Off", func() {
-		clipboardSyncing = !clipboardSyncing
-		if clipboardSyncing {
-			clipBtn.SetText("Clip Sync: On")
-			go syncClipboard(cl, a.mainWindow)
-		} else {
+		if clipStop != nil {
+			// Stop existing goroutine.
+			close(clipStop)
+			clipStop = nil
 			clipBtn.SetText("Clip Sync: Off")
+		} else {
+			// Start new goroutine.
+			clipStop = make(chan struct{})
+			clipBtn.SetText("Clip Sync: On")
+			go syncClipboard(cl, a.mainWindow, clipStop)
 		}
 	})
 
@@ -402,18 +406,24 @@ func (a *App) showRemoteDesktop(cl *client.Client) {
 }
 
 // syncClipboard periodically sends the local clipboard to the remote host.
-func syncClipboard(cl *client.Client, win fyne.Window) {
+// It stops when the stop channel is closed or the client disconnects.
+func syncClipboard(cl *client.Client, win fyne.Window, stop <-chan struct{}) {
 	var lastClip string
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	for range ticker.C {
-		if !cl.IsConnected() {
+	for {
+		select {
+		case <-stop:
 			return
-		}
-		clip := win.Clipboard().Content()
-		if clip != "" && clip != lastClip {
-			lastClip = clip
-			cl.SendClipboard(clip)
+		case <-ticker.C:
+			if !cl.IsConnected() {
+				return
+			}
+			clip := win.Clipboard().Content()
+			if clip != "" && clip != lastClip {
+				lastClip = clip
+				cl.SendClipboard(clip)
+			}
 		}
 	}
 }
