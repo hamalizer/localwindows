@@ -131,7 +131,7 @@ func (s *Server) Start() error {
 	s.injector = input.New()
 	if err := s.injector.Init(); err != nil {
 		log.Printf("warning: input injection unavailable: %v", err)
-		// Continue anyway; viewer will be view-only.
+		s.injector = nil // Mark as unavailable to prevent crash.
 	}
 
 	// Generate TLS config with self-signed cert.
@@ -246,14 +246,21 @@ func (s *Server) handleClient(raw net.Conn) {
 	}
 
 	// Start goroutines for this client.
+	// When either goroutine exits (e.g. conn error), cancel the context
+	// and close the conn so the other goroutine unblocks immediately
+	// instead of waiting up to the keepalive timeout.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		defer clientCancel()
+		defer conn.Close()
 		s.streamFrames(clientCtx, conn)
 	}()
 	go func() {
 		defer wg.Done()
+		defer clientCancel()
+		defer conn.Close()
 		s.handleInputEvents(clientCtx, conn)
 	}()
 	wg.Wait()
@@ -403,29 +410,38 @@ func (s *Server) handleInputEvents(ctx context.Context, conn *protocol.Conn) {
 			return
 		}
 
-		screenW, screenH := s.capturer.ScreenSize()
-
 		switch msgType {
 		case protocol.MsgMouseMove:
+			if s.injector == nil {
+				continue
+			}
 			var msg protocol.MouseMoveMsg
 			if err := protocol.DecodeJSON(payload, &msg); err != nil {
 				continue
 			}
+			screenW, screenH := s.capturer.ScreenSize()
 			x := int(msg.X * float64(screenW))
 			y := int(msg.Y * float64(screenH))
 			s.injector.MouseMove(x, y)
 
 		case protocol.MsgMouseButton:
+			if s.injector == nil {
+				continue
+			}
 			var msg protocol.MouseButtonMsg
 			if err := protocol.DecodeJSON(payload, &msg); err != nil {
 				continue
 			}
+			screenW, screenH := s.capturer.ScreenSize()
 			x := int(msg.X * float64(screenW))
 			y := int(msg.Y * float64(screenH))
 			s.injector.MouseMove(x, y)
 			s.injector.MouseButton(msg.Button, msg.Pressed)
 
 		case protocol.MsgMouseScroll:
+			if s.injector == nil {
+				continue
+			}
 			var msg protocol.MouseScrollMsg
 			if err := protocol.DecodeJSON(payload, &msg); err != nil {
 				continue
@@ -433,6 +449,9 @@ func (s *Server) handleInputEvents(ctx context.Context, conn *protocol.Conn) {
 			s.injector.MouseScroll(int(msg.DX), int(msg.DY))
 
 		case protocol.MsgKeyEvent:
+			if s.injector == nil {
+				continue
+			}
 			var msg protocol.KeyEventMsg
 			if err := protocol.DecodeJSON(payload, &msg); err != nil {
 				continue
@@ -440,6 +459,9 @@ func (s *Server) handleInputEvents(ctx context.Context, conn *protocol.Conn) {
 			s.injector.KeyPress(input.Key(msg.Key), msg.Pressed)
 
 		case protocol.MsgSpecialKeys:
+			if s.injector == nil {
+				continue
+			}
 			var msg protocol.SpecialKeysMsg
 			if err := protocol.DecodeJSON(payload, &msg); err != nil {
 				continue
@@ -519,7 +541,16 @@ func (s *Server) handleFileChunk(payload []byte) {
 	if !ok {
 		return
 	}
-	n, _ := state.file.Write(data)
+	n, werr := state.file.Write(data)
+	if werr != nil {
+		log.Printf("file write error for %s: %v", transferID, werr)
+		// Close and remove the failed transfer.
+		state.file.Close()
+		s.fileTransfersMu.Lock()
+		delete(s.fileTransfers, transferID)
+		s.fileTransfersMu.Unlock()
+		return
+	}
 	state.received += int64(n)
 }
 

@@ -50,7 +50,7 @@ func (s *interactiveScreen) CreateRenderer() fyne.WidgetRenderer {
 // accounting for aspect-ratio fitting.
 func (s *interactiveScreen) normalize(pos fyne.Position) (float64, float64) {
 	size := s.Size()
-	if size.Width <= 0 || size.Height <= 0 {
+	if size.Width <= 0 || size.Height <= 0 || s.remoteW <= 0 || s.remoteH <= 0 {
 		return 0, 0
 	}
 	aspect := float32(s.remoteW) / float32(s.remoteH)
@@ -61,6 +61,9 @@ func (s *interactiveScreen) normalize(pos fyne.Position) (float64, float64) {
 	} else {
 		drawW = size.Width
 		drawH = drawW / aspect
+	}
+	if drawW <= 0 || drawH <= 0 {
+		return 0, 0
 	}
 	offX := (size.Width - drawW) / 2
 	offY := (size.Height - drawH) / 2

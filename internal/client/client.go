@@ -112,7 +112,14 @@ func (c *Client) Connect(cfg ConnectConfig) (*protocol.ServerHello, error) {
 
 	// Read screen info.
 	var screenInfo protocol.ScreenInfo
-	c.conn.ReadJSONMessage(&screenInfo)
+	if _, err := c.conn.ReadJSONMessage(&screenInfo); err != nil {
+		c.conn.Close()
+		return nil, fmt.Errorf("read screen info: %w", err)
+	}
+	if screenInfo.Width <= 0 || screenInfo.Height <= 0 {
+		c.conn.Close()
+		return nil, fmt.Errorf("invalid screen dimensions: %dx%d", screenInfo.Width, screenInfo.Height)
+	}
 
 	c.mu.Lock()
 	c.screenW = screenInfo.Width
